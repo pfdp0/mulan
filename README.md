@@ -15,12 +15,12 @@ Linear evaluation results on **ImageNet-1k**.
 
 | Method             | Backbone  | Epochs | Lin. Acc. (%) | Backbone weights                                                                                        |
 |--------------------|-----------|--------|---------------|---------------------------------------------------------------------------------------------------------|
-| SimSiam multi-task | ResNet-50 | 200    | 74.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/simsiam_multitask_resnet50_200ep_ckpt.pth) |
-| MoCo v3 multi-task | ResNet-50 | 200    | 75.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/mocov3_multitask_resnet50_200ep_ckpt.pth)  |
-| BYOL multi-task    | ResNet-50 | 200    | 75.6          | [Link](#)                                                                                               |
-| BYOL multi-task    | ResNet-50 | 800    | 76.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/byol_multitask_resnet50_800ep_ckpt.pth)    |
-| BYOL multi-task    | ViT-S     | 200    | 74.5          | [Link](#)                                                                                               |
-| BYOL multi-task    | ViT-B     | 200    | 78.3          | [Link](#)                                                                                               |
+| SimSiam multi-task | ResNet-50 | 200    | 74.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/simsiam_multitask_resnet50_200ep_ckpt.pth) |
+| MoCo v3 multi-task | ResNet-50 | 200    | 75.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/mocov3_multitask_resnet50_200ep_ckpt.pth)  |
+| BYOL multi-task    | ResNet-50 | 200    | 75.6          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/byol_multitask_resnet50_200ep_ckpt.pth)    |
+| BYOL multi-task    | ResNet-50 | 800    | 76.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/byol_multitask_resnet50_800ep_ckpt.pth)    |
+| BYOL multi-task    | ViT-S     | 200    | 74.5          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/byol_multitask_vits_200ep_tgt_ckpt.pth)    |
+| BYOL multi-task    | ViT-B     | 200    | 78.3          | [Link](https://github.com/pfdp0/mulan/releases/download/v2.0/byol_multitask_vitb_200ep_tgt_ckpt.pth)    |
 
 ---
 
