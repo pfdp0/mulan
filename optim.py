@@ -147,6 +147,7 @@ def get_optimizer(args, model):
             parameters,
             lr=0,  # will be set later in adjust_learning_rate()
             weight_decay=args.wd,
+            betas=(0.9, args.adam_beta2),
         )
     elif args.optimizer == "lars":
         assert not args.use_constant_pred_lr, "LARS with constant predictor lr not implemented"

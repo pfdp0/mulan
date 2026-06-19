@@ -3,12 +3,15 @@
 
 import math
 from typing import Tuple, Dict, Sequence, Optional
+import warnings
+from abc import ABC, abstractmethod
+import contextlib
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from models import BYOLNetwork, BYOLChimeraNetwork
+import models as models
 import distributed as dist
 
 
@@ -27,14 +30,66 @@ def norm_cos_sim_loss(pred: Tensor, tgt: Tensor):
     return loss
 
 
-class BYOLAlgorithm:
+class SSLAlgorithm(ABC):
+    """
+    Base class for self-supervised learning algorithms.
+    Defines the interface for the main methods: update_target and training_step.
+    """
+    @abstractmethod
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def update_target(self, step: int) -> None:
+        """
+        Update the target model parameters based on the online model parameters and the current step.
+        :note: For algorithms without a target model, this can be a no-op.
+        """
+        pass
+
+    @abstractmethod
+    def training_step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
+        """
+        Perform a training step given a tuple of images (views).
+        Runs the forward pass, computes the loss, and performs the backward pass.
+        Args:
+            images_tuple: A tuple of Tensors, each of shape (N, C, H, W), representing different views of the same images.
+            step: The current training step, used for scheduling.
+            scaler: Optional GradScaler for mixed precision training.
+        Returns:
+            A dictionary of logs to be recorded, e.g. losses, metrics, etc.
+        """
+        pass
+
+    @torch.no_grad()
+    def format_logs(self, raw_logs: Dict) -> Dict:
+        """
+        Method to convert raw logs (which may contain Tensors) into a format suitable for logging.
+        Args:
+            raw_logs: The raw logs dictionary returned by training_step.
+        Returns:
+            A formatted logs dictionary for logging.
+        """
+        formatted_logs = {}
+        for key, value in raw_logs.items():
+            if isinstance(value, Tensor):
+                formatted_logs[key] = value.item()  # convert Tensor to scalar
+            else:
+                formatted_logs[key] = value  # keep non-Tensor values unchanged
+
+        return formatted_logs
+
+
+class BYOLAlgorithm(SSLAlgorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork,
-            target_model: BYOLNetwork,
+            online_model: models.BYOLNetwork,
+            target_model: models.BYOLNetwork,
             base_target_ema: float,
             num_steps: int,
     ):
+        super().__init__()
+
         assert 0 <= base_target_ema <= 1
         assert num_steps > 0
 
@@ -45,129 +100,118 @@ class BYOLAlgorithm:
 
     def get_tau(self, step: int) -> float:
         ema_delta = 1.0 - self.base_target_ema
-        step = step % self.num_steps
         return 1.0 - ema_delta * (math.cos(math.pi * step / self.num_steps) + 1) / 2
 
     @torch.no_grad()
-    def _update_target(self, tau: float) -> None:
+    def update_target(self, step: int) -> None:
+        tau = self.get_tau(step)
         for param_online, param_target in zip(self.online_model.parameters(), self.target_model.parameters()):
             param_target.data.mul_(tau).add_(param_online.data, alpha=1 - tau)
 
-    def step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
         assert len(images_tuple) == 2, "Image tuple must contain two Tensors"
-
-        # update target model: EMA of online model weights
-        tau = self.get_tau(step)
-        self._update_target(tau)
 
         # forward pass
         images_1, images_2 = images_tuple
 
         # targets
         with torch.no_grad():
-            tgt_1, _ = self.target_model(images_1)
-            tgt_2, _ = self.target_model(images_2)
+            target_out_1 = self.target_model(images_1)
+            target_out_2 = self.target_model(images_2)
 
         # predictions and loss computation
-        loss_item: float = 0.0
+        loss_for_logging = torch.tensor(0.0, device=images_tuple[0].device)  # to log the unscaled loss
 
-        _, pred_1 = self.online_model(images_1)
-        loss_1 = norm_cos_sim_loss(pred_1, tgt_2.detach())
-        loss_item += loss_1.item()
+        online_out_1 = self.online_model(images_1)
+        loss_1 = norm_cos_sim_loss(online_out_1["predictions"], target_out_2["embeddings"].detach())
+        loss_for_logging = loss_for_logging + loss_1.detach()
         if scaler is not None:
             scaler.scale(loss_1).backward()
         else:
             loss_1.backward()
 
-        _, pred_2 = self.online_model(images_2)
-        loss_2 = norm_cos_sim_loss(pred_2, tgt_1.detach())
-        loss_item += loss_2.item()
+        online_out_2 = self.online_model(images_2)
+        loss_2 = norm_cos_sim_loss(online_out_2["predictions"], target_out_1["embeddings"].detach())
+        loss_for_logging = loss_for_logging + loss_2.detach()
         if scaler is not None:
             scaler.scale(loss_2).backward()
         else:
             loss_2.backward()
 
         log_dict = {
-            "loss": loss_item,
-            "tau": tau,
+            "loss": loss_for_logging
         }
 
         return log_dict
 
 
-class SimSiamAlgorithm:
-    def __init__(self, online_model: BYOLNetwork, target_model: BYOLNetwork):
+class SimSiamAlgorithm(SSLAlgorithm):
+    def __init__(self, online_model: models.BYOLNetwork, target_model: models.BYOLNetwork):
         """
         note: having two model copies is wasteful,
         but allows to save GPU memory by having separated forward-backward passes.
         """
+        super().__init__()
+
         self.online_model = online_model
         self.target_model = target_model
 
         self.loss_fn = torch.nn.CosineSimilarity(dim=1)
 
     @torch.no_grad()
-    def _update_target(self) -> None:
+    def update_target(self, step: int) -> None:
         for param_online, param_target in zip(self.online_model.parameters(), self.target_model.parameters()):
             param_target.data.copy_(param_online.data)
         for buffer_online, buffer_target in zip(self.online_model.buffers(), self.target_model.buffers()):
             buffer_target.data.copy_(buffer_online.data)
 
-    def step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
         assert len(images_tuple) == 2, "Image tuple must contain two Tensors"
-
-        self._update_target()  # copy weights from online model to target model
 
         # forward pass
         images_1, images_2 = images_tuple
 
         # targets
         with torch.no_grad():
-            tgt_1, _ = self.target_model(images_1)
-            tgt_2, _ = self.target_model(images_2)
+            target_out_1 = self.target_model(images_1)
+            target_out_2 = self.target_model(images_2)
 
         # predictions and loss computation
-        loss_item: float = 0.0
+        loss_for_logging = torch.tensor(0.0, device=images_tuple[0].device)  # to log the unscaled loss
 
-        backup_tgt_1, pred_1 = self.online_model(images_1)
-        loss_1 = - 0.5 * self.loss_fn(pred_1, tgt_2.detach()).mean()
-        loss_item += loss_1.item()
+        online_out_1 = self.online_model(images_1)
+        loss_1 = - 0.5 * self.loss_fn(online_out_1["predictions"], target_out_2["embeddings"].detach()).mean()
+        loss_for_logging = loss_for_logging + loss_1.detach()
         if scaler is not None:
             scaler.scale(loss_1).backward()
         else:
             loss_1.backward()
 
-        _, pred_2 = self.online_model(images_2)
-        loss_2 = - 0.5 * self.loss_fn(pred_2, tgt_1.detach()).mean()
-        loss_item += loss_2.item()
+        online_out_2 = self.online_model(images_2)
+        loss_2 = - 0.5 * self.loss_fn(online_out_2["predictions"], target_out_1["embeddings"].detach()).mean()
+        loss_for_logging = loss_for_logging + loss_2.detach()
         if scaler is not None:
             scaler.scale(loss_2).backward()
         else:
             loss_2.backward()
 
         log_dict = {
-            "loss": loss_item,
+            "loss": loss_for_logging
         }
 
         return log_dict
 
 
-class MoCov3Algorithm:
+class MoCov3Algorithm(BYOLAlgorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork,
-            target_model: BYOLNetwork,
+            online_model: models.BYOLNetwork,
+            target_model: models.BYOLNetwork,
             base_target_ema: float,
             num_steps: int,
             loss_temp: float = 1.0
     ):
-        assert 0 <= base_target_ema <= 1
-        assert num_steps > 0
-
-        self.online_model = online_model
-        self.target_model = target_model
-        self.base_target_ema = base_target_ema
-        self.num_steps = num_steps
+        super().__init__(online_model, target_model, base_target_ema, num_steps)
         self.loss_temp = loss_temp
 
     def contrastive_loss(self, q, k):
@@ -183,102 +227,69 @@ class MoCov3Algorithm:
         labels = (torch.arange(batch_size_per_gpu, dtype=torch.long) + gpu_shift).cuda()
         return F.cross_entropy(logits, labels) * (2.0 * self.loss_temp)
 
-    def get_tau(self, step: int) -> float:
-        ema_delta = 1.0 - self.base_target_ema
-        return 1.0 - ema_delta * (math.cos(math.pi * step / self.num_steps) + 1) / 2
-
-    @torch.no_grad()
-    def _update_target(self, tau: float) -> None:
-        for param_online, param_target in zip(self.online_model.parameters(), self.target_model.parameters()):
-            param_target.data.mul_(tau).add_(param_online.data, alpha=1 - tau)
-
-    def step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
         assert len(images_tuple) == 2, "Image tuple must contain two Tensors"
-
-        # update target model: EMA of online model weights
-        tau = self.get_tau(step)
-        self._update_target(tau)
 
         # forward pass
         images_1, images_2 = images_tuple
 
         # targets
         with torch.no_grad():
-            tgt_1, _ = self.target_model(images_1)
-            tgt_2, _ = self.target_model(images_2)
+            target_out_1 = self.target_model(images_1)
+            target_out_2 = self.target_model(images_2)
 
         # predictions and loss computation
-        loss_item: float = 0.0
+        loss_for_logging = torch.tensor(0.0, device=images_tuple[0].device)  # to log the unscaled loss
 
-        _, pred_1 = self.online_model(images_1)
-        loss_1 = self.contrastive_loss(pred_1, tgt_2.detach())
-        loss_item += loss_1.item()
+        online_out_1 = self.online_model(images_1)
+        loss_1 = self.contrastive_loss(online_out_1["predictions"], target_out_2["embeddings"].detach())
+        loss_for_logging = loss_for_logging + loss_1.detach()
         if scaler is not None:
             scaler.scale(loss_1).backward()
         else:
             loss_1.backward()
 
-        _, pred_2 = self.online_model(images_2)
-        loss_2 = self.contrastive_loss(pred_2, tgt_1.detach())
-        loss_item += loss_2.item()
+        online_out_2 = self.online_model(images_2)
+        loss_2 = self.contrastive_loss(online_out_2["predictions"], target_out_1["embeddings"].detach())
+        loss_for_logging = loss_for_logging + loss_2.detach()
         if scaler is not None:
             scaler.scale(loss_2).backward()
         else:
             loss_2.backward()
 
         log_dict = {
-            "loss": loss_item,
-            "tau": tau,
+            "loss": loss_for_logging
         }
 
         return log_dict
 
 
-class BYOLAsymmetricAlgorithm:
+class BYOLAsymmetricAlgorithm(BYOLAlgorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork,
-            target_model: BYOLNetwork,
+            online_model: models.BYOLNetwork,
+            target_model: models.BYOLNetwork,
             base_target_ema: float,
             num_steps: int,
     ):
-        assert 0 <= base_target_ema <= 1
-        assert num_steps > 0
+        super().__init__(online_model, target_model, base_target_ema, num_steps)
 
-        self.online_model = online_model
-        self.target_model = target_model
-        self.base_target_ema = base_target_ema
-        self.num_steps = num_steps
-
-    def get_tau(self, step: int) -> float:
-        ema_delta = 1.0 - self.base_target_ema
-        return 1.0 - ema_delta * (math.cos(math.pi * step / self.num_steps) + 1) / 2
-
-    @torch.no_grad()
-    def _update_target(self, tau: float) -> None:
-        for param_online, param_target in zip(self.online_model.parameters(), self.target_model.parameters()):
-            param_target.data.mul_(tau).add_(param_online.data, alpha=1 - tau)
-
-    def step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple[Tensor, Tensor], step: int, scaler: Optional = None) -> Dict:
         assert len(images_tuple) == 2, "Image tuple must contain two Tensors"
-
-        # update target model: EMA of online model weights
-        tau = self.get_tau(step)
-        self._update_target(tau)
 
         # forward pass
         images_1, images_2 = images_tuple
 
         # target
         with torch.no_grad():
-            tgt_2, _ = self.target_model(images_2)
+            target_out = self.target_model(images_2)
 
         # prediction
-        _, pred_1 = self.online_model(images_1)
+        online_out = self.online_model(images_1)
 
         # loss computation
-        loss_1 = 2.0 * norm_cos_sim_loss(pred_1, tgt_2.detach())
-        loss_item: float = loss_1.item()
+        loss_1 = 2.0 * norm_cos_sim_loss(online_out["predictions"], target_out["embeddings"].detach())
+        loss_for_logging = loss_1.detach()
 
         # backward pass
         if scaler is not None:
@@ -287,8 +298,7 @@ class BYOLAsymmetricAlgorithm:
             loss_1.backward()
 
         log_dict = {
-            "loss": loss_item,
-            "tau": tau,
+            "loss": loss_for_logging
         }
 
         return log_dict
@@ -297,8 +307,8 @@ class BYOLAsymmetricAlgorithm:
 class BYOLMultiTaskAlgorithm(BYOLAlgorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork | BYOLChimeraNetwork,
-            target_model: BYOLNetwork | BYOLChimeraNetwork,
+            online_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
+            target_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
             base_target_ema: float,
             num_steps: int,
             tasks: Sequence[str] = ("global", "local", "cutout"),
@@ -316,64 +326,62 @@ class BYOLMultiTaskAlgorithm(BYOLAlgorithm):
         self.num_views_per_task = num_views_per_task
         self.task_loss_weights = task_loss_weights
 
-        self.all_params_except_predictors = [
-            param for name, param in self.online_model.named_parameters()
-            if not "predictor." in name and not "predictors." in name
-        ]
-        print(f"Number of encoder parameters: {sum(p.numel() for p in self.all_params_except_predictors)}")
-
-    def step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
         num_input_views = len(images_tuple)
         num_global_views = self.num_views_per_task[0]
         assert sum(self.num_views_per_task) == num_input_views, \
             (f"Mismatch in number of views, "
              f"expected {sum(self.num_views_per_task)} views but input has {num_input_views} views")
 
-        # update target model: EMA of online model weights
-        tau = self.get_tau(step)
-        self._update_target(tau)
+        # initialize logs
+        log_dict = {
+            "loss": torch.tensor(0.0, device=images_tuple[0].device)
+        }
+        log_dict.update({f"loss_{task}": torch.tensor(0.0, device=images_tuple[0].device) for task in self.tasks})
 
         # targets: global views only
         tgt_list = []
         with torch.no_grad():
             for images in images_tuple[:num_global_views]:
-                tgt, _ = self.target_model(images, view_type="identity")
-                tgt_list.append(tgt)
+                target_out = self.target_model(images, view_type="identity")
+                tgt_list.append(target_out["embeddings"])
 
-        log_dict = {}
         # predictions and loss computation
         view_idx = 0  # index for the current view in images_tuple
         for task, num_views, weight in zip(self.tasks, self.num_views_per_task, self.task_loss_weights):
-            loss_task_item: float = 0.0
             num_loss_terms_task = (num_views * num_global_views) if task != "global" else num_views
 
-            for tvid in range(num_views):
-                # forward pass for the current view
-                feats, pred = self.online_model(images_tuple[view_idx], view_type=task)
-                feats = feats.detach()  # use detached features for variance computation
-
-                # compute losses for the current prediction
-                loss_sub = torch.tensor(0.0, device=pred.device)
-                for tgt_idx in range(num_global_views):
-                    if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
-                        loss_sub += norm_cos_sim_loss(pred, tgt_list[tgt_idx].detach())
-                loss_sub = weight * loss_sub / num_loss_terms_task
-                loss_task_item += loss_sub.item()
-
-                # backward pass for the current pred (saves memory)
-                if scaler is not None:
-                    scaler.scale(loss_sub).backward()
+            for _ in range(num_views):
+                # avoid DDP gradient synchronization for intermediate views (i.e., sync in the end)
+                is_last_view = (view_idx == num_input_views - 1)
+                if is_last_view or not hasattr(self.online_model, "no_sync"):
+                    context = contextlib.nullcontext()
                 else:
-                    loss_sub.backward()
+                    context = self.online_model.no_sync()
+
+                with context:
+                    # forward pass for the current view
+                    online_out = self.online_model(images_tuple[view_idx], view_type=task)
+
+                    # compute losses for the current prediction
+                    loss_sub = torch.tensor(0.0, device=online_out["predictions"].device)
+                    for tgt_idx in range(num_global_views):
+                        if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
+                            loss_sub += norm_cos_sim_loss(online_out["predictions"], tgt_list[tgt_idx].detach())
+                    loss_sub = weight * loss_sub / num_loss_terms_task
+                    log_dict[f"loss_{task}"] = log_dict[
+                                                   f"loss_{task}"] + loss_sub.detach()  # log the loss for the current view
+
+                    # backward pass for the current pred (frees up memory)
+                    if scaler is not None:
+                        scaler.scale(loss_sub).backward()
+                    else:
+                        loss_sub.backward()
 
                 view_idx += 1
 
-            log_dict[f"loss_{task}"] = loss_task_item  # log the loss for each task
-
-        log_dict.update({
-            "loss": sum(log_dict[f"loss_{task}"] for task in self.tasks),
-            "tau": tau,
-        })
+            # accumulate task loss into the overall loss
+            log_dict["loss"] = log_dict["loss"] + log_dict[f"loss_{task}"]
 
         return log_dict
 
@@ -381,8 +389,8 @@ class BYOLMultiTaskAlgorithm(BYOLAlgorithm):
 class SimSiamMultiTaskAlgorithm(SimSiamAlgorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork | BYOLChimeraNetwork,
-            target_model: BYOLNetwork | BYOLChimeraNetwork,
+            online_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
+            target_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
             tasks: Sequence[str] = ("global", "local", "cutout"),
             num_views_per_task: Sequence[int] = (2, 2, 1),
             task_loss_weights: Sequence[float] = (0.5, 0.5, 0.5)
@@ -398,54 +406,59 @@ class SimSiamMultiTaskAlgorithm(SimSiamAlgorithm):
         self.num_views_per_task = num_views_per_task
         self.task_loss_weights = task_loss_weights
 
-    def step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
         num_input_views = len(images_tuple)
         num_global_views = self.num_views_per_task[0]
         assert sum(self.num_views_per_task) == num_input_views, \
             (f"Mismatch in number of views, "
              f"expected {sum(self.num_views_per_task)} views but input has {num_input_views} views")
 
-        self._update_target()  # copy weights from online model to target model
+        # initialize logs
+        log_dict = {"loss": torch.tensor(0.0, device=images_tuple[0].device)}
+        log_dict.update({f"loss_{task}": torch.tensor(0.0, device=images_tuple[0].device) for task in self.tasks})
 
         # targets: global views only
         tgt_list = []
         with torch.no_grad():
             for images in images_tuple[:num_global_views]:
-                tgt, _ = self.target_model(images, view_type="identity")
-                tgt_list.append(tgt)
+                target_out = self.target_model(images, view_type="identity")
+                tgt_list.append(target_out["embeddings"])
 
-        log_dict = {}
         # predictions and loss computation
         view_idx = 0  # index for the current view in images_tuple
         for task, num_views, weight in zip(self.tasks, self.num_views_per_task, self.task_loss_weights):
-            loss_task_item: float = 0.0
             num_loss_terms_task = (num_views * num_global_views) if task != "global" else num_views
 
             for _ in range(num_views):
-                # forward pass for the current view
-                _, pred = self.online_model(images_tuple[view_idx], view_type=task)
-
-                # compute losses for the current prediction
-                loss_sub = torch.tensor(0.0, device=pred.device)
-                for tgt_idx in range(num_global_views):
-                    if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
-                        loss_sub += - self.loss_fn(pred, tgt_list[tgt_idx].detach()).mean()
-                loss_sub = weight * loss_sub / num_loss_terms_task
-                loss_task_item += loss_sub.item()
-
-                # backward pass for the current pred (saves memory)
-                if scaler is not None:
-                    scaler.scale(loss_sub).backward()
+                # avoid DDP gradient synchronization for intermediate views (i.e., sync in the end)
+                is_last_view = (view_idx == num_input_views - 1)
+                if is_last_view or not hasattr(self.online_model, "no_sync"):
+                    context = contextlib.nullcontext()
                 else:
-                    loss_sub.backward()
+                    context = self.online_model.no_sync()
+
+                with context:
+                    # forward pass for the current view
+                    online_out = self.online_model(images_tuple[view_idx], view_type=task)
+
+                    # compute losses for the current prediction
+                    loss_sub = torch.tensor(0.0, device=online_out["predictions"].device)
+                    for tgt_idx in range(num_global_views):
+                        if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
+                            loss_sub += - self.loss_fn(online_out["predictions"], tgt_list[tgt_idx].detach()).mean()
+                    loss_sub = weight * loss_sub / num_loss_terms_task
+                    log_dict[f"loss_{task}"] = log_dict[f"loss_{task}"] + loss_sub.detach()  # log the unscaled loss for the current view
+
+                    # backward pass for the current pred (saves memory)
+                    if scaler is not None:
+                        scaler.scale(loss_sub).backward()
+                    else:
+                        loss_sub.backward()
 
                 view_idx += 1
 
-            log_dict[f"loss_{task}"] = loss_task_item  # log the loss for each task
-
-        log_dict.update({
-            "loss": sum(log_dict[f"loss_{task}"] for task in self.tasks),
-        })
+            # accumulate task loss into the overall loss
+            log_dict["loss"] = log_dict["loss"] + log_dict[f"loss_{task}"]
 
         return log_dict
 
@@ -453,8 +466,8 @@ class SimSiamMultiTaskAlgorithm(SimSiamAlgorithm):
 class MoCov3MultiTaskAlgorithm(MoCov3Algorithm):
     def __init__(
             self,
-            online_model: BYOLNetwork | BYOLChimeraNetwork,
-            target_model: BYOLNetwork | BYOLChimeraNetwork,
+            online_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
+            target_model: models.BYOLNetwork | models.BYOLChimeraNetwork,
             base_target_ema: float,
             num_steps: int,
             loss_temp: float = 1.0,
@@ -473,64 +486,66 @@ class MoCov3MultiTaskAlgorithm(MoCov3Algorithm):
         self.num_views_per_task = num_views_per_task
         self.task_loss_weights = task_loss_weights
 
-    def step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
+    def training_step(self, images_tuple: Tuple, step: int, scaler: Optional = None) -> Dict:
         num_input_views = len(images_tuple)
         num_global_views = self.num_views_per_task[0]
         assert sum(self.num_views_per_task) == num_input_views, \
             (f"Mismatch in number of views, "
              f"expected {sum(self.num_views_per_task)} views but input has {num_input_views} views")
 
-        # update target model: EMA of online model weights
-        tau = self.get_tau(step)
-        self._update_target(tau)
+        # initialize logs similarly to BYOLMultiTaskAlgorithm
+        log_dict = {"loss": torch.tensor(0.0, device=images_tuple[0].device)}
+        log_dict.update({f"loss_{task}": torch.tensor(0.0, device=images_tuple[0].device) for task in self.tasks})
 
         # targets: global views only
         tgt_list = []
         with torch.no_grad():
             for images in images_tuple[:num_global_views]:
-                tgt, _ = self.target_model(images, view_type="identity")
-                tgt_list.append(tgt)
+                target_out = self.target_model(images, view_type="identity")
+                tgt_list.append(target_out["embeddings"])
 
-        log_dict = {}
         # predictions and loss computation
         view_idx = 0  # index for the current view in images_tuple
         for task, num_views, weight in zip(self.tasks, self.num_views_per_task, self.task_loss_weights):
-            loss_task_item: float = 0.0
             num_loss_terms_task = (num_views * num_global_views) if task != "global" else num_views
 
             for _ in range(num_views):
-                # forward pass for the current view
-                _, pred = self.online_model(images_tuple[view_idx], view_type=task)
-
-                # compute losses for the current prediction
-                loss_sub = torch.tensor(0.0, device=pred.device)
-                for tgt_idx in range(num_global_views):
-                    if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
-                        loss_sub += self.contrastive_loss(pred, tgt_list[tgt_idx].detach())
-                loss_sub = weight * loss_sub / num_loss_terms_task
-                loss_task_item += loss_sub.item()
-
-                # backward pass for the current pred (saves memory)
-                if scaler is not None:
-                    scaler.scale(loss_sub).backward()
+                # avoid DDP gradient synchronization for intermediate views (i.e., sync in the end)
+                is_last_view = (view_idx == num_input_views - 1)
+                if is_last_view or not hasattr(self.online_model, "no_sync"):
+                    context = contextlib.nullcontext()
                 else:
-                    loss_sub.backward()
+                    context = self.online_model.no_sync()
+
+                with context:
+                    # forward pass for the current view
+                    online_out = self.online_model(images_tuple[view_idx], view_type=task)
+
+                    # compute losses for the current prediction
+                    loss_sub = torch.tensor(0.0, device=online_out["predictions"].device)
+                    for tgt_idx in range(num_global_views):
+                        if view_idx != tgt_idx:  # skip the case where prediction and target are from the same view
+                            loss_sub += self.contrastive_loss(online_out["predictions"], tgt_list[tgt_idx].detach())
+                    loss_sub = weight * loss_sub / num_loss_terms_task
+                    log_dict[f"loss_{task}"] = log_dict[f"loss_{task}"] + loss_sub.detach()
+
+                    # backward pass for the current pred (saves memory)
+                    if scaler is not None:
+                        scaler.scale(loss_sub).backward()
+                    else:
+                        loss_sub.backward()
 
                 view_idx += 1
 
-            log_dict[f"loss_{task}"] = loss_task_item  # log the loss for each task
-
-        log_dict.update({
-            "loss": sum(log_dict[f"loss_{task}"] for task in self.tasks),
-            "tau": tau,
-        })
+            # accumulate task loss into the overall loss
+            log_dict["loss"] = log_dict["loss"] + log_dict[f"loss_{task}"]
 
         return log_dict
 
 
 def get_algorithm(
-        online_model: BYOLNetwork | BYOLChimeraNetwork,
-        target_model: BYOLNetwork | BYOLChimeraNetwork,
+        online_model: torch.nn.Module,
+        target_model: torch.nn.Module,
         total_num_steps: int,
         args
 ):

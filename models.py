@@ -3,9 +3,10 @@
 # Inspired by BarlowTwins (https://github.com/facebookresearch/barlowtwins).
 
 import argparse
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 import warnings
 
+import torch
 from torch import nn, Tensor
 
 import resnet
@@ -58,49 +59,80 @@ def get_backbone(args: argparse.Namespace, is_target: bool = False) -> Tuple[nn.
     return backbone, embedding_dim
 
 
-class BYOLNetwork(nn.Module):
-    """
-    Siamese Networks composed of a backbone, a projector and a predictor as used in BYOL, SimSiam and related methods.
-    """
+class SSLNetwork(nn.Module):
     def __init__(self, args: argparse.Namespace, is_target: bool = False):
         super().__init__()
         self.num_features = int(args.projector_mlp.split("-")[-1])
+        self.args = args
+
+        self.backbone, self.backbone_out_dim = get_backbone(args, is_target=is_target)
+
+        self.projector = get_mlp(args.projector_mlp, self.backbone_out_dim, activation=args.projector_activ,
+                                 use_output_bn=args.use_proj_output_bn)
+
+    def forward(self, images: Tensor) -> Dict[str, Tensor]:
+        """
+        Forward pass of the network.
+        :param images: Input images tensor of shape (N, C, H, W)
+        """
+        h = self.backbone(images)
+        z = self.projector(h)
+
+        return {
+            "backbone_feats": h,
+            "embeddings": z
+        }
+
+
+class BYOLNetwork(SSLNetwork):
+    """
+    Siamese Networks composed of a backbone, a projector, and a predictor as used in BYOL, SimSiam, and related methods.
+    """
+    def __init__(self, args: argparse.Namespace, is_target: bool = False):
+        super().__init__(args, is_target=is_target)
+
         pred_out_dim = int(args.predictor_mlp.split("-")[-1])
         assert self.num_features == pred_out_dim, \
             f"Projector and predictor output dimensions must match, got {self.num_features} and {pred_out_dim}"
-        self.args = args
 
-        self.backbone, self.embedding_dim = get_backbone(args, is_target=is_target)
-        self.projector = get_mlp(args.projector_mlp, self.embedding_dim, activation=args.projector_activ,
-                                 use_output_bn=args.use_proj_output_bn)
         self.predictor = get_mlp(args.predictor_mlp, self.num_features, activation=args.predictor_activ,
                                  use_output_bn=args.use_pred_output_bn)
 
-    def forward(self, images: Tensor, view_type: Optional[str] = None) -> tuple:
+    def forward(self, images: Tensor, view_type: Optional[str] = None) -> Dict[str, Tensor]:
         """
         Forward pass of the BYOL network.
         :param images: Input images tensor of shape (N, C, H, W)
         :param view_type: Optional view type, not used in the base BYOLNetwork.
         """
-        z = self.projector(self.backbone(images))
+        h = self.backbone(images)
+        z = self.projector(h)
         pred = self.predictor(z)
 
-        return z, pred
+        return {
+            "backbone_feats": h,
+            "embeddings": z,
+            "predictions": pred
+        }
 
 
-class BYOLChimeraNetwork(BYOLNetwork):
+class BYOLChimeraNetwork(SSLNetwork):
     """
     Multi-headed Siamese Networks composed of a backbone, a projector and multiple predictors.
     """
     def __init__(self, args: argparse.Namespace, is_target: bool = False):
         super().__init__(args, is_target=is_target)
-        del self.predictor  # discard the old single predictor
+
+        pred_out_dim = int(args.predictor_mlp.split("-")[-1])
+        assert self.num_features == pred_out_dim, \
+            f"Projector and predictor output dimensions must match, got {self.num_features} and {pred_out_dim}"
+
         predictors = {"identity": nn.Identity()}  # dummy predictor when no prediction is needed
         for task in args.tasks:
-            predictors[task] = get_mlp(args.predictor_mlp, self.num_features, activation=args.predictor_activ)
+            predictors[task] = get_mlp(args.predictor_mlp, self.num_features, activation=args.predictor_activ,
+                                       use_output_bn=args.use_pred_output_bn)
         self.predictors = nn.ModuleDict(predictors)
 
-    def forward(self, images: Tensor, view_type: str = "global") -> tuple:
+    def forward(self, images: Tensor, view_type: str = "global") -> Dict[str, Tensor]:
         """
         Forward pass of the BYOL chimera network.
         :param images: Input images tensor of shape (N, C, H, W)
@@ -109,7 +141,12 @@ class BYOLChimeraNetwork(BYOLNetwork):
         assert view_type in self.predictors.keys(), \
             f"view type should be one of {self.predictors.keys()}, but got {view_type}"
 
-        z = self.projector(self.backbone(images))
+        h = self.backbone(images)
+        z = self.projector(h)
         pred = self.predictors[view_type](z)
 
-        return z, pred
+        return {
+            "backbone_feats": h,
+            "embeddings": z,
+            "predictions": pred
+        }

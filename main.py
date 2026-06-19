@@ -12,10 +12,10 @@ import math
 
 import torch
 from torch import nn
-import torchvision.datasets as datasets
 import wandb
 
 import config as cfg
+from datasets import ReturnIndexDataset
 import augmentations as aug
 import utils
 from distributed import init_distributed_mode, is_main_process
@@ -26,7 +26,7 @@ from optim import get_optimizer, adjust_learning_rate, adjust_learning_rate_per_
 
 
 def get_arguments():
-    parser = argparse.ArgumentParser(description="Pretrain a Siamese asymmetric SSL model", add_help=False)
+    parser = argparse.ArgumentParser(description="Pretrain a Siamese self-predictive SSL model", add_help=False)
 
     # Model
     parser.add_argument("--arch", type=str, default="resnet50",
@@ -78,6 +78,8 @@ def get_arguments():
                         help='Base target EMA for the momentum encoder')
     parser.add_argument('--optimizer', default='lars', type=str, choices=['adamw', 'lars', 'sgd'],
                         help='Optimizer to use for training')
+    parser.add_argument('--adam-beta2', type=float, default=0.999,
+                        help='Beta2 for AdamW optimizer, default is 0.999 (i.e. PyTorch default)')
     parser.add_argument("--base-lr", type=float, default=0.4,
                         help='Base learning rate, effective learning after warmup is [base-lr] * [batch-size] / 256')
     parser.add_argument("--base-lr-biases", type=float, default=None,
@@ -130,21 +132,30 @@ def get_arguments():
     parser.add_argument('--compile', action='store_true',
                         help='use torch.compile() to compile the training loop')
     parser.add_argument('--sync-target-bn', action='store_true')
-    parser.add_argument('--no-sync-online-bn', action='store_true')
-    parser.add_argument('--fp16', action=argparse.BooleanOptionalAction, default=True,
-                        help='mixed precision training (use --no-fp16 to disable)')
+    parser.add_argument('--dtype', default='fp16', choices=['fp16', 'fp32', 'bf16'],
+                        help='data type to use for training (note: bf16 is only available on Ampere and later GPUs)')
 
     return parser
 
 
-class ReturnIndexDataset(datasets.ImageFolder):
-    def __getitem__(self, idx):
-        img, lab = super(ReturnIndexDataset, self).__getitem__(idx)
-        return img, idx
+def _set_backends_and_dtype(args):
+    torch.backends.cudnn.benchmark = True  # auto-tuned for best performance
+    DTYPE_MAP = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+    }
+    amp_dtype = DTYPE_MAP[args.dtype]
+    if args.dtype == 'fp32':
+        print("Using fp32 training with TF32 (Ampere and later GPUs)")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    return amp_dtype
 
 
 def main(args):
-    torch.backends.cudnn.benchmark = True
+    amp_dtype = _set_backends_and_dtype(args)
     init_distributed_mode(args)
     torch.set_num_threads(2)
 
@@ -194,10 +205,7 @@ def main(args):
         online_model = BYOLNetwork(args, is_target=False)
         target_model = BYOLNetwork(args, is_target=True)
 
-    print("Online model:")
-    print(online_model)
-    print("Target model:")
-    print(target_model)
+    print(f"{online_model = }")
 
     # initialize target model with online model weights
     target_model.load_state_dict(online_model.state_dict(), strict=True)
@@ -206,20 +214,14 @@ def main(args):
     target_model = target_model.to(args.device)
 
     if args.distributed:
-        if not args.no_sync_online_bn:
-            print("SyncBN on online model")
-            online_model = nn.SyncBatchNorm.convert_sync_batchnorm(online_model)
         if args.sync_target_bn:
             print("SyncBN on target model")
             target_model = nn.SyncBatchNorm.convert_sync_batchnorm(target_model)
 
-        broadcast_buffers = (not args.no_sync_online_bn or args.sync_target_bn)
-        if not broadcast_buffers:
-            warnings.warn("Disabling DDP buffers broadcasting, may have a negative impact at EVAL.")
         online_model = torch.nn.parallel.DistributedDataParallel(
             online_model,
             device_ids=[args.gpu],
-            broadcast_buffers=broadcast_buffers,
+            broadcast_buffers=True,
             find_unused_parameters=("multitask" in args.training_fn and not args.single_pred_head)  # needed for multitask
         )
         if args.sync_target_bn:
@@ -227,29 +229,20 @@ def main(args):
             target_model = torch.nn.parallel.DistributedDataParallel(
                 target_model,
                 device_ids=[args.gpu],
-                broadcast_buffers=False
+                broadcast_buffers=False,
+                static_graph=True
             )
 
     # freeze after DDP to avoid issues
     target_model.requires_grad_(False)
 
-    if args.compile:
-        # compile models only if not in DDP wrapper
-        if not args.distributed:
-            print("Compiling online model with online_model.backbone.compile(mode='default')")
-            online_model.backbone.compile(mode='default')
-        if not args.sync_target_bn:
-            print("Compiling target model with: target_model.backbone.compile(mode='max-autotune')")
-            target_model.backbone.compile(mode='max-autotune')
-
     # create optimizer and scaler
     optimizer = get_optimizer(args, online_model)
-    scaler = torch.amp.GradScaler(enabled=args.fp16)
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'fp16'))
 
     if args.use_per_epoch_sched:
         print("Updating learning rate once an epoch instead of every step")
 
-    print(f"Starting training for {args.epochs} epochs, mixed precision: {args.fp16}")
     # resume from checkpoint if needed
     start_epoch = 0
     if args.resume:  # and is_main_process():
@@ -274,6 +267,13 @@ def main(args):
     total_num_steps = args.epochs * len(loader)
     algorithm = get_algorithm(online_model, target_model, total_num_steps, args)
 
+    if args.compile:
+        torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+        print("Compiling training step and target update functions with torch.compile(mode='reduce-overhead')")
+        algorithm.training_step = torch.compile(algorithm.training_step, mode='reduce-overhead')
+        algorithm.update_target = torch.compile(algorithm.update_target, mode='reduce-overhead')
+
+    print(f"Starting training for {args.epochs} epochs, {args.dtype = }")
     online_model.train()
     target_model.train()
     for epoch in range(start_epoch, args.epochs):
@@ -301,18 +301,24 @@ def main(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda', enabled=args.fp16):
-                log_dict = algorithm.step(images_tuple, step=global_step, scaler=scaler)
+            # update target network before the training step
+            algorithm.update_target(global_step)
+            with torch.amp.autocast('cuda', enabled=(args.dtype != 'fp32'), dtype=amp_dtype):
+                log_dict = algorithm.training_step(images_tuple, step=global_step, scaler=scaler)
+
+            log_dict = algorithm.format_logs(log_dict)  # convert tensors to scalars, etc.
+            if hasattr(algorithm, "get_tau"):
+                log_dict["tau"] = algorithm.get_tau(global_step)
 
             if not math.isfinite(log_dict['loss']):
                 print(f"Loss is {log_dict['loss']}, stopping training")
                 sys.exit(1)
 
+            # clip gradients if needed, and run optimizer step
+            scaler.unscale_(optimizer)
             if args.clip_grad > 0:
-                scaler.unscale_(optimizer)  # unscale for correct gradient clipping
                 grad_norm = torch.nn.utils.clip_grad_norm_(online_model.parameters(), args.clip_grad)
             else:
-                scaler.unscale_(optimizer)
                 grad_norm = utils.compute_grad_norm(online_model.parameters())
             scaler.step(optimizer)
             scaler.update()
@@ -351,19 +357,24 @@ def main(args):
         if (epoch+1) % args.knn_eval_freq == 0:
             print("kNN evaluation...")
             args.pretrained = args.output_dir / "checkpoint.pth"
-            acc1, acc5 = evaluate_knn(args, train_dataset=dataset)
+            acc1_dict, acc5_dict = evaluate_knn(args, train_dataset=dataset)
             if is_main_process():
-                log_dict = dict(acc1=acc1, acc5=acc5, epoch=epoch)
+                log_dict = dict(
+                    acc1_k20=acc1_dict[20], acc5_k20=acc5_dict[20],
+                    acc1_k10=acc1_dict[10], acc5_k10=acc5_dict[10],
+                    epoch=(epoch + 1)
+                )
                 print(json.dumps(log_dict), file=stats_file)
                 if wandb.run is not None:
                     wandb.log(log_dict, step=(epoch+1) * num_steps)
 
     if is_main_process():
         torch.save(online_model.module.backbone.state_dict(), args.output_dir / "backbone.pth")
+        torch.save(target_model.module.backbone.state_dict(), args.output_dir / "backbone_tgt.pth")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser('BYOL training script', parents=[get_arguments()])
+    parser = argparse.ArgumentParser('Pre-training script', parents=[get_arguments()])
     args = parser.parse_args()
 
     # create output dir

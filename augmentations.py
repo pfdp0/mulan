@@ -560,9 +560,10 @@ class TrainTransformMultiTask(object):
 
     def __call__(self, sample):
         sample_img = transforms_v2.functional.to_image(sample)
-        views_list = list()
-        views_list.append(self.transforms_dict["global_1"](sample_img))
-        views_list.append(self.transforms_dict["global_2"](sample_img))
+        views_list = [
+            self.transforms_dict["global_1"](sample_img),
+            self.transforms_dict["global_2"](sample_img)
+        ]
         for task, num_views in zip(self.tasks[1:], self.num_views_per_task[1:]):
             for _ in range(num_views):
                 views_list.append(self.transforms_dict[task](sample_img))
@@ -571,7 +572,7 @@ class TrainTransformMultiTask(object):
 
 def get_train_transforms(args):
     version = args.transform
-    if version == "byole":  # BYOL's default
+    if version == "byol":  # BYOL's default
         return TrainTransformBYOL()
     elif version == "simsiam":  # SimSiam's default
         return TrainTransformSimSiam()

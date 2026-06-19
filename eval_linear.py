@@ -59,6 +59,9 @@ def get_arguments():
                         help='stochastic depth rate (not used for linear eval, set to 0)')
     parser.add_argument('--nesterov', action='store_true', help='use Nesterov momentum')
 
+    parser.add_argument("--lin-model-choice", type=str, default="online_model",
+                        help="which model to use for linear evaluation when multiple are present in the checkpoint")
+
     # Optim
     parser.add_argument(
         "--epochs",
@@ -108,7 +111,8 @@ def get_arguments():
         metavar="N",
         help="number of data loader workers",
     )
-    parser.add_argument("--no-fp16", action="store_true", help="disable mixed precision")
+    parser.add_argument('--dtype', default='fp16', choices=['fp16', 'fp32', 'bf16'],
+                        help='data type to use for training (note: bf16 is only available on Ampere and later GPUs)')
 
     parser.add_argument("--use-jax-resnet", action="store_true",
                         help="use JAX ResNet50 implementation (for models converted from JAX)")
@@ -126,6 +130,13 @@ def main():
     torch.backends.cudnn.benchmark = True
     dist_utils.init_distributed_mode(args)
     torch.set_num_threads(2)
+
+    DTYPE_MAP = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+    }
+    amp_dtype = DTYPE_MAP[args.dtype]
 
     args.output_dir = Path(cfg.EXP_ROOT) / args.experiment_name
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -147,8 +158,9 @@ def main():
               f"{'and avgpool of patch tokens, ' if args.avgpool_patchtokens else ''}"
               f"effective embedding dimension is {embedding_dim}")
     state_dict = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
+    if args.lin_model_choice in state_dict:
+        print(f"Linear evaluation with {args.lin_model_choice}")
+        state_dict = state_dict[args.lin_model_choice]
         state_dict = {
             key.replace("module.backbone.", ""): value
             for (key, value) in state_dict.items()
@@ -182,7 +194,7 @@ def main():
     if args.weights == "finetune":
         param_groups.append(dict(params=backbone.parameters(), lr=args.lr_backbone))
     optimizer = optim.SGD(param_groups, 0, momentum=0.9, weight_decay=args.wd, nesterov=args.nesterov)
-    scaler = torch.amp.GradScaler(enabled=not args.no_fp16)
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'fp16'))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
     # automatically resume from checkpoint if it exists
@@ -285,11 +297,8 @@ def main():
     eval_type = f"Finetune {args.train_percent}%" if args.weights == "finetune" else f"Linear"
 
     num_steps = len(train_loader)
-    if not args.no_fp16:
-        print(f"{eval_type} evaluation with mixed precision")
-    else:
-        print(f"{eval_type} evaluation without mixed precision")
 
+    print(f"{eval_type} evaluation with {args.dtype} dtype")
     for epoch in range(start_epoch, args.epochs):
         # set epoch for distributed sampler
         if args.distributed:
@@ -318,7 +327,7 @@ def main():
             optimizer.zero_grad()
 
             # forward pass backbone
-            with torch.amp.autocast('cuda', enabled=not args.no_fp16):
+            with torch.amp.autocast('cuda', enabled=(args.dtype != 'fp32'), dtype=amp_dtype):
                 if "vit" in args.arch:
                     intermediate_output = backbone.get_intermediate_layers(images, args.n_last_blocks)
                     features = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
@@ -333,18 +342,14 @@ def main():
                 features = (features - features_mean) / (features_std[None, :] + 1e-8)  # normalize the features
 
             # forward pass head
-            with torch.amp.autocast('cuda', enabled=not args.no_fp16):
+            with torch.amp.autocast('cuda', enabled=(args.dtype != 'fp32'), dtype=amp_dtype):
                 output = head(features)
 
             loss = criterion(output, targets)
 
-            if not args.no_fp16:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             pg = optimizer.param_groups
             lr_head = pg[0]["lr"]

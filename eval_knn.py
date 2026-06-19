@@ -8,7 +8,7 @@ import sys
 from typing import Optional
 import warnings
 
-from torchvision import datasets, transforms
+import torchvision.transforms.v2 as transforms_v2
 import torch
 from torch.amp import autocast
 from torch.nn import functional as F
@@ -16,6 +16,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 import config as cfg
+from datasets import ReturnIndexDataset
 from distributed import init_distributed_mode, is_main_process, get_world_size
 from models import get_backbone
 
@@ -48,13 +49,6 @@ def get_arguments():
         metavar="N",
         help="number of data loader workers",
     )
-    parser.add_argument(
-        "--knn-k",
-        default=20,
-        type=int,
-        metavar="K",
-        help="number of nearest neighbors for KNN"
-    )
 
     parser.add_argument("--update-bn-stats", action="store_true",
                         help="update BatchNorm statistics before evaluation")
@@ -63,12 +57,6 @@ def get_arguments():
                         help="use JAX ResNet50 implementation (for models converted from JAX)")
 
     return parser
-
-
-class ReturnIndexDataset(datasets.ImageFolder):
-    def __getitem__(self, idx):
-        img, lab = super(ReturnIndexDataset, self).__getitem__(idx)
-        return img, idx
 
 
 @torch.no_grad()
@@ -179,7 +167,7 @@ def knn_classifier(train_features, train_labels, test_features, test_labels,
 
         all_indices[idx: min((idx + imgs_per_chunk), num_test_images), :] = indices
 
-        if idx % (imgs_per_chunk * 10) == 0:
+        if idx % (imgs_per_chunk * 100) == 0:
             print(f"Processed {idx}/{num_test_images} images")
 
     top1 = top1 * 100.0 / total
@@ -214,12 +202,13 @@ def evaluate_knn(args, train_dataset: Optional[ReturnIndexDataset] = None):
     # Data loading code
     traindir = Path(cfg.IMAGENET_ROOT_DIR) / "train"
     valdir = Path(cfg.IMAGENET_ROOT_DIR) / "val"
-    test_transforms = transforms.Compose(
+    test_transforms = transforms_v2.Compose(
         [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
+            transforms_v2.ToImage(),  # ensures the image is a Tensor
+            transforms_v2.Resize(256),
+            transforms_v2.CenterCrop(224),
+            transforms_v2.ToDtype(torch.float32, scale=True),  # values are scaled to [0, 1] here
+            transforms_v2.Normalize(
                 mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             )
         ]
@@ -248,7 +237,7 @@ def evaluate_knn(args, train_dataset: Optional[ReturnIndexDataset] = None):
     else:
         train_sampler = torch.utils.data.RandomSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(train_dataset, sampler=train_sampler, **kwargs)
-    val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=True, **kwargs)
+    val_loader = torch.utils.data.DataLoader(val_dataset, **kwargs)
 
     if args.knn_model_mode == "eval":
         backbone.eval()
@@ -271,13 +260,17 @@ def evaluate_knn(args, train_dataset: Optional[ReturnIndexDataset] = None):
         train_labels = torch.tensor(train_dataset.targets).to(train_features.device)
         val_labels = torch.tensor(val_dataset.targets).to(train_features.device)
 
-        acc1, acc5, topk_indices = knn_classifier(train_features, train_labels,
-                                                  val_features, val_labels,
-                                                  k=args.knn_k, T=0.07,
-                                                  num_classes=len(train_dataset.classes),
-                                                  similarity_type="cosine")
+        acc1_dict, acc5_dict = {}, {}
+        for knn_k in [10, 20]:
+            acc1_dict[knn_k], acc5_dict[knn_k], topk_indices = knn_classifier(
+                train_features, train_labels,
+                val_features, val_labels,
+                k=knn_k, T=0.07,
+                num_classes=len(train_dataset.classes),
+                similarity_type="cosine"
+            )
 
-        print(f"{args.knn_k}-NN classifier result: Acc@1: {acc1}%, Acc@5: {acc5}%")
+            print(f"{knn_k}-NN classifier result: Acc@1: {acc1_dict[knn_k]}%, Acc@5: {acc5_dict[knn_k]}%")
 
     if args.distributed:
         torch.distributed.barrier()
@@ -290,7 +283,7 @@ def evaluate_knn(args, train_dataset: Optional[ReturnIndexDataset] = None):
         print(f"back to:\n\t{train_dataset.transform = }")
 
     if is_main_process():
-        return acc1, acc5
+        return acc1_dict, acc5_dict
     return -1, -1
 
 
@@ -307,8 +300,10 @@ def main():
     torch.backends.cudnn.benchmark = True
     init_distributed_mode(args)
 
-    acc1, acc5, = evaluate_knn(args)
-    print(f"Done: Acc@1: {acc1}%, Acc@5: {acc5}%")
+    acc1_dict, acc5_dict, = evaluate_knn(args)
+    print(f"Done."
+          f"\n\tAcc@1 dict: {acc1_dict}"
+          f"\n\tAcc@5 dict: {acc5_dict}")
     if args.distributed:
         torch.distributed.destroy_process_group()
 

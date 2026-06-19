@@ -1,64 +1,111 @@
-# Self-Supervised Learning with a Multi-Task Latent Space Objective
+# Self-Supervised Learning with a Multi-Task Latent Space Objective (MULAN)
 
-This repository contains the code and pre-trained models for the paper "Self-Supervised Learning with a Multi-Task Latent Space Objective" (MULAN).
+Official PyTorch implementation of the paper  
+**"Self-Supervised Learning with a Multi-Task Latent Space Objective"**.
 
-Paper link: [https://arxiv.org/abs/2602.05845](https://arxiv.org/abs/2602.05845)
+📄 Paper: https://arxiv.org/abs/2602.05845
 
 ![MULAN overview](figs/mulan_overview.jpg)
 
-## Pretrained Models
+---
 
-The following table summarizes the linear evaluation accuracy of various self-supervised learning methods trained with the multi-task latent space objective on ImageNet-1k. 
+# Pretrained Models
 
-| Method             | Backbone  | Epochs | Lin. Acc. (%) | Backbone weights |
-|--------------------|-----------|--------|---------------|------------------|
-| SimSiam multi-task | ResNet-50 | 200    | 74.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/simsiam_multitask_resnet50_200ep_ckpt.pth)        |
-| MoCo v3 multi-task | ResNet-50 | 200    | 75.3          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/mocov3_multitask_resnet50_200ep_ckpt.pth)        |
-| BYOL multi-task    | ResNet-50 | 200    | 75.6          | [Link](#)        |
-| BYOL multi-task    | ResNet-50 | 800    | 76.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/byol_multitask_resnet50_800ep_ckpt.pth)        |
-| BYOL multi-task    | ViT-S     | 200    | 74.0          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/byol_multitask_vits_200ep_ckpt.pth)        |
-| BYOL multi-task    | ViT-B     | 200    | 77.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/byol_multitask_vitb_200ep_ckpt.pth)        |
+Linear evaluation results on **ImageNet-1k**.
 
-## Installation
+| Method             | Backbone  | Epochs | Lin. Acc. (%) | Backbone weights                                                                                        |
+|--------------------|-----------|--------|---------------|---------------------------------------------------------------------------------------------------------|
+| SimSiam multi-task | ResNet-50 | 200    | 74.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/simsiam_multitask_resnet50_200ep_ckpt.pth) |
+| MoCo v3 multi-task | ResNet-50 | 200    | 75.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/mocov3_multitask_resnet50_200ep_ckpt.pth)  |
+| BYOL multi-task    | ResNet-50 | 200    | 75.6          | [Link](#)                                                                                               |
+| BYOL multi-task    | ResNet-50 | 800    | 76.7          | [Link](https://github.com/pfdp0/mulan/releases/download/v1.0/byol_multitask_resnet50_800ep_ckpt.pth)    |
+| BYOL multi-task    | ViT-S     | 200    | 74.5          | [Link](#)                                                                                               |
+| BYOL multi-task    | ViT-B     | 200    | 78.3          | [Link](#)                                                                                               |
 
-You can install the dependencies using pip:
+---
+
+# Installation
+
+### Option 1: pip
 
 ```bash
-pip install torch==2.8 torchvision torchaudio detectron2 tqdm matplotlib wandb scipy scikit-learn
+pip install \
+    torch==2.10 \
+    torchvision \
+    torchaudio \
+    detectron2 \
+    tqdm \
+    matplotlib \
+    wandb \
+    scipy \
+    scikit-learn
 ```
 
-Alternatively, to install the dependencies using mamba, you can run the following commands:
+### Option 2: mamba
 
 ```bash
 mamba create -n mulan_env python=3.12 pip
 mamba activate mulan_env
-mamba install pytorch==2.8 torchvision torchaudio detectron2 tqdm matplotlib wandb scipy anaconda::scikit-learn
+mamba install pytorch==2.10 torchvision torchaudio detectron2 tqdm matplotlib wandb scipy anaconda::scikit-learn
 ```
 
-Note: the detectron2 dependency is only required for object detection and instance segmentation transfer learning experiments.
+> `detectron2` is only required for COCO detection and instance segmentation experiments.
 
-## Usage
+---
 
-Pre-training a ResNet-50 BYOL with multi-task latent space objective on ImageNet-1k for 200 epochs on one node with 4 GPUs:
+# Setup
+
+- Download ImageNet-1k and define the paths to the data in `config.py` under `IMAGENET_ROOT_DIR`.
+- Also define the paths to the output directory in `config.py` under `EXP_ROOT` 
+- Optionally set the W&B project in `config.py` under `WANDB_PROJECT` and `WANDB_ENTITY`.
+
+---
+
+# Usage
+
+## Pre-training
+
+Pre-training a ResNet-50 BYOL with multi-task latent space objective on ImageNet-1k for 200 epochs using 4 GPUs:
 ```bash
-torchrun --standalone --nproc_per_node 4 main.py --training_fn byol_multitask --transform multitask --tasks global local cutout --num-views-per-task 2 2 1 --task-weights 1.0 1.0 1.0
+torchrun --standalone --nproc_per_node 4 main.py --training-fn byol_multitask --transform multitask --tasks global local cutout --num-views-per-task 2 2 1 --task-weights 1.0 1.0 1.0
 ```
 
-Or with a single GPU (max memory will be around 24GB):
+Or with a single GPU:
 ```bash
-python main.py --batch-size 512 --training_fn byol_multitask --transform multitask --tasks global local cutout --num-views-per-task 2 2 1 --task-weights 1.0 1.0 1.0
+python main.py --batch-size 512 --training-fn byol_multitask --transform multitask --tasks global local cutout --num-views-per-task 2 2 1 --task-weights 1.0 1.0 1.0
 ```
 
-For more details on the training configurations, please refer to the [CONFIG.md](CONFIG.md) file.
+> Expected peak GPU memory usage: ~24 GB.
 
-Linear evaluation of a pre-trained ResNet-50 model:
+For additional configuration options, see [CONFIG.md](CONFIG.md).
+
+---
+
+## Linear evaluation
+
+Evaluate a pretrained ResNet-50 on ImageNet-1k:
+
 ```bash
-python linear_eval.py --backbone resnet50 --pretrained PATH/TO/PRETRAINED/WEIGHTS.pth
+python linear_eval.py --backbone resnet50 --pretrained PATH/TO/PRETRAINED/WEIGHTS.pth --normalize-features --batch-size 512 --wd 0.0 --lr-head 0.005
 ```
 
+---
+## Transfer Learning on COCO
+
+### Step 1: Convert weights to Detectron2 format
+```bash
+python detection/convert-pretrain-to-detectron2.py PATH/TO/PRETRAINED/WEIGHTS.pth PATH/TO/OUTPUT/DETECTRON2_WEIGHTS.pkl
+```
+
+### Step 2: Fine-tune Mask R-CNN
+```bash
+python detection/train_coco.py --config-file ./configs/coco_R50_MaskRCNN-FPN_ssl_L.yaml --num-gpus 4 MODEL.WEIGHTS PATH/TO/DETECTRON2_WEIGHTS.pkl
+```
+
+---
 ## Citation
 
-Please consider citing our paper if you find this code useful for your research:
+If you find this repository useful in your research, please cite:
 
 ```
 @article{deplaen2026mulan,
